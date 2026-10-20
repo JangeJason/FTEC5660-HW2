@@ -83,8 +83,44 @@ def build_agent(tools: list[Any]) -> Any:
     from .env.
     """
     ### YOUR CODE HERE
-    _ = tools
-    return None
+    import os
+    from langchain_deepseek import ChatDeepSeek
+    from langchain.agents import create_agent
+
+    llm = ChatDeepSeek(
+        model=MODEL_NAME,
+        api_key=os.environ.get("DEEPSEEK_API_KEY"),
+        temperature=0.0,
+    )
+
+    system_prompt = (
+        "You are an expert KYC & CV verification agent. Your task is to verify whether the claims in a candidate's CV "
+        "strictly match their official LinkedIn and Facebook profiles retrieved via MCP tools.\n\n"
+        "### Verification Workflow:\n"
+        "1. Extract candidate's name, city, jobs (company, title, seniority, start/end years), education (degree, school, field, graduation year), and skills from the CV text.\n"
+        "2. Search LinkedIn using `search_linkedin_people` with the candidate's name (and optionally city).\n"
+        "3. Entity Resolution: Many candidates share the same name. Compare candidate's location, companies, or schools to identify the exact `person_id`.\n"
+        "4. Retrieve complete profile using `get_linkedin_profile(person_id)` (and `get_facebook_profile` if needed; LinkedIn is the primary source).\n"
+        "5. Check discrepancies ONLY in these fields:\n"
+        "   - Name & City: Must match.\n"
+        "   - Jobs: Company name, job title, seniority, start year, end year (or current status). Any mismatch (e.g. started 2014 but CV claims 2015, or inflated seniority) is a discrepancy.\n"
+        "   - Education: School name, degree (e.g. BSc upgraded to MSc is false), field of study, graduation year.\n"
+        "   - Skills: EVERY skill claimed on the CV MUST be present in the candidate's profile skills. If the CV lists a skill that does not exist in the profile, it is a discrepancy.\n\n"
+        "### Rules on What is NOT a Discrepancy:\n"
+        "   - Differences in wording only are NOT discrepancies (e.g., 'Bachelor of Science' vs 'BSc', 'UI/UX Design' vs 'UI/UX').\n"
+        "   - Listing fewer skills on the CV than on the profile is valid.\n"
+        "   - Job descriptions, headline, and hometown are NEVER the source of a discrepancy.\n\n"
+        "### Final Output Requirement:\n"
+        "If ALL checked claims agree with the profiles (valid), output exactly: 0.95\n"
+        "If there is AT LEAST ONE discrepancy or false/inflated claim, output exactly: 0.05\n"
+        "Conclude your answer with ONLY the single numeric score (e.g., 0.95 or 0.05)."
+    )
+
+    return create_agent(
+        model=llm,
+        tools=tools,
+        system_prompt=system_prompt,
+    )
 
 
 async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
@@ -106,8 +142,45 @@ async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
     shared by the whole class.
     """
     ### YOUR CODE HERE
-    _ = agent
-    return {name: None for name in cvs}
+    semaphore = asyncio.Semaphore(1)
+
+    async def verify_cv(name: str, content: str) -> tuple[str, float]:
+        async with semaphore:
+            for attempt in range(3):
+                try:
+                    user_msg = (
+                        f"Please verify this candidate's CV against the SocialGraph MCP database.\n\n"
+                        f"CV Content for {name}:\n"
+                        f"{content}\n\n"
+                        f"Output 0.95 if completely valid, or 0.05 if any discrepancy exists."
+                    )
+                    response = await agent.ainvoke({
+                        "messages": [{"role": "user", "content": user_msg}]
+                    })
+                    messages = response.get("messages", [])
+                    last_msg = messages[-1].content if messages else str(response)
+
+                    score = parse_score(last_msg)
+                    if score is None:
+                        nums = _NUMBER_RE.findall(str(last_msg))
+                        if nums:
+                            candidate_score = float(nums[-1])
+                            if 0.0 <= candidate_score <= 1.0:
+                                score = candidate_score
+
+                    if score is not None:
+                        return name, score
+                except Exception as e:
+                    if attempt < 2:
+                        await asyncio.sleep(1.5)
+                    else:
+                        print(f"[Warning] Failed to verify {name} after 3 attempts: {e}")
+
+            return name, 0.5
+
+    tasks = [verify_cv(name, content) for name, content in cvs.items()]
+    results = await asyncio.gather(*tasks)
+    return dict(results)
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
